@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+
+import argparse
+import what3words as w3w
+import sys
+import sqlite3
+import re
+import os
+from datetime import datetime
+
+# get arguments
+parser = argparse.ArgumentParser()
+
+parser.add_argument("-g", "--get",
+                    help="Display information without affecting the database",
+                    dest="get",
+                    action='store_true')
+
+# Plant arguments - Latin name is the only required plant field and initiates
+# creation or editing of a plant in the database. Specifying a plant argument
+# without also specifying the Latin name is an error
+
+parser.add_argument("-ln", "--latin",
+                    help="The Latin name of the plant",
+                    default="")
+parser.add_argument("-cn", "--common",
+                    help="The common name of the plant",
+                    default="")
+parser.add_argument("-i", "--idnote",
+                    help="A note on identifying the plant.\
+                          Run multiple times to add more than one note.",
+                    default="")
+parser.add_argument("-u", "--usenote",
+                    help="A note on using the plant.\
+                          Run multiple times to add more than one note.",
+                    default="")
+
+# Spot arguments - Location is the only required spot field and initiates
+# creation or editing of a spot in the database. Specifying a spot argument
+# without also specifying the location is an error
+
+parser.add_argument("-loc", "--location",
+                    help="what3words location",
+                    default="")
+parser.add_argument("-s", "--spotnote",
+                    help="A note on the spot.\
+                          Run multiple times to add more than one note.",
+                    default="")
+
+args = parser.parse_args()
+
+# global variables
+
+with open(os.path.expanduser("~/bin/my_utilities/config/w3w-key")) as f:
+    key = f.readline().strip()
+gc = w3w.Geocoder(key)
+
+do_plant = bool(args.latin)
+do_spot = bool(args.location)
+do_plant_spot = do_plant and do_spot
+
+db_file_path = "~/bin/my_utilities/databases/foragespot/database.db"
+db_new = not os.path.isfile(db_file_path)
+sqlite3_detect_types = sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+db = sqlite3.connect(db_file_path, detect_types=sqlite3_detect_types)
+
+
+# utility functions
+
+def matches_regex(regex, text):
+    """
+    Returns true only if the whole of the text matches the regex
+    """
+    match = re.match(regex, text)
+    return match.span() == (0, len(text))
+
+
+def errorandquit(error_message):
+    """
+    Print help message plus an error message"""
+    parser.print_help(sys.stderr)
+    sys.stderr.write(sys.argv[0] + ": " + error_message + "\n")
+    sys.exit(1)
+
+
+def remove_empty_values(d):
+    """
+    Remove entries from a dictionary where the values are empty
+    """
+    return {k: v for (k, v) in d.items() if bool(v)}
+
+
+def append_csv_list(value, csv_list):
+    """
+    Take a csv list and append value to it
+    """
+    csv_list = [csv_list, value]
+    return ", ".join(csv_list)
+
+
+def csv_list(csv_list):
+    """
+    Convert csv list to a python list
+    """
+    return csv_list.split(", ")
+
+
+# location functions - for interacting with the what3words api
+
+def w3w_coord(w3w_location):
+    """
+    A wrapper around convert_to_coordinates function from what3words api that
+    doesn't require messing about with their data type
+    """
+    coord_location = gc.convert_to_coordinates(w3w_location)
+    coords = coord_location["coordinates"]
+    return coords["lng"], coords["lat"]
+
+
+def coord_w3w(coord_location):
+    """
+    A wrapper around convert_to_3wa function from what3words api that
+    doesn't require messing about with their data type
+    """
+    w3w_coords = w3w.Coordinates(*coord_location)
+    w3w_location = gc.convert_to_3wa(w3w.Coordinates(w3w_coords))
+    return w3w_location["words"]
+
+# verification functions - for verifying and formatting inputs
+
+
+def is_latin(latin_name):
+    """
+    Verifies a Latin name. It must start with a capital letter and have at
+    least two words. Subsequent words must start with a lowercase letter.
+    """
+    regex = "[A-Z][a-z]* [ a-z]*"
+    return matches_regex(regex, latin_name)
+
+
+def make_latin_case(latin_name):
+    """
+    Correctly capitalises a Latin name. That is, the first word is capitalised
+    and subsequent words are entirely in lowercase.
+
+    This does not verify that the name is in the correct format. This should be
+    done after capitalising it.
+    """
+    split_name = latin_name.split()
+    split_name = [word.lower() for word in split_name]
+    split_name[0] = split_name[0].capitalize()
+    return " ".join(split_name)
+
+
+def is_w3w(w3w_location):
+    """
+    Verifies that a string conforms to the correct what3words address format.
+    That is, three words separated by a dot.
+    """
+    split_location = w3w_location.split(".")
+    # needs three words
+    if len(split_location) != 3:
+        return False
+    # none of the words should be empty
+    elif 0 in [len(word) for word in split_location]:
+        return False
+    # is it valid according to w3w's official regex?
+    else:
+        # official w3w regex
+        regex = "^/*[^0-9`~!@#$%^&*()+\-_=[.][^\s]{1,}[・.][^\s]{1,}$"
+        return matches_regex(regex, w3w_location)
+
+
+# database command and datatype construction
+
+def db_construct_select(table, key, value):
+    """
+    Construct a select statement in SQL syntax. select the entry in table whose
+    key is equal to value.
+    """
+    elements = ["SELECT * FROM ", table, " WHERE ", key, " == '", value, "'"]
+    return "".join(elements)
+
+
+def db_construct_update(table, key, value, search_key, search_value):
+    """
+    Construct an update statement in SQL syntax. Update the key of the entry
+    whose search_key is equal to search_value so that key equals value
+    """
+    elements = ["UPDATE ", table, " SET ", key, " = '", value, "' WHERE ",
+                search_key, " == '", search_value, "'"]
+    return "".join(elements)
+
+
+def db_construct_insert(table, values):
+    """
+    Constructs an insert statement in SQL syntax. Adds an entry into table
+    with an autoincrementing id, with fields inserted in the order specified
+    in values.
+    """
+    values = ["'" + value + "'" for value in values]
+    values = ", ".join(values)
+    elements = ["INSERT INTO ", table, " VALUES(", values, ")"]
+    return "".join(elements)
+
+
+def construct_update_dict(update, original, csv_keys):
+    """
+    Constructs an update dictionary (plant or spot).
+
+    First, removes empty entries from the update dictionary.
+
+    If the key is specified in csv_keys, the corresponding value in the update
+    dict is appended to the value in the original dict. Values with keys that
+    are not present in csv_keys are retained as is.
+    """
+    update = remove_empty_values(update)
+    for key in update:
+        if key in csv_keys:
+            csv_value = append_csv_list(update[key], original[key])
+            update[key] = csv_value
+    return update
+
+
+# low-level database functions
+
+def create_db():
+    """
+    Create the database. To be used if the database has not yet been created
+    """
+    cursor = db.cursor()
+
+    cursor.execute("CREATE TABLE plants(id integer PRIMARY KEY, latin text,\
+                    common text, spots text, id_notes text, use_notes text)")
+    cursor.execute("CREATE TABLE spots(id integer PRIMARY KEY, w3w_name text,\
+                    lat real, lng real, plants text, notes text)")
+    cursor.execute("CREATE TABLE notes(id integer PRIMARY KEY, time timestamp,\
+                    notes text)")
+
+    cursor.close()
+
+
+def db_get(table, key, value):
+    """
+    Returns a list of all entries in table where column key equals value
+    """
+    cursor = db.cursor()
+    db_select = db_construct_select(table, key, value)
+    cursor.execute(db_select)
+    data = cursor.fetchall()
+    cursor.close()
+    return data
+
+
+def db_exists(table, key, value):
+    """
+    Checks if entries exist in table where key equals value.
+    Returns True if so, otherwise False
+    """
+    data = db_get(table, key, value)
+    return bool(len(data))
+
+
+def db_update(table, key, value, search_key, search_value):
+    """
+    Update the entry in table whose search_key equals search_value so that
+    key equals value
+    """
+    cursor = db.cursor()
+    db_update = db.db_construct_update(table, key, value,
+                                       search_key, search_value)
+    cursor.execute(db_update)
+    cursor.close()
+
+
+def db_update_multi(table, d, primary):
+    """
+    Update the entry in table whose primary column is equal to that value in d
+    so that the columns named in the keys of the dictionary equal the
+    corresponding value in the dictionary.
+
+    Assumes that the keys in the dictionary are the same as the column names
+    in the database.
+    """
+    update_values = dict(d)
+    update_values.pop(primary)
+    for k, v in update_values:
+        db_update(table, k, v, primary, d[primary])
+
+
+def db_insert(table, values):
+    """
+    Insert an entry into table. Returns the id of the new row.
+    """
+    cursor = db.cursor()
+    db_insert = db_construct_insert(table, values)
+    cursor.execute(db_insert)
+    id = cursor.lastrowid()
+    cursor.close()
+    return id
+
+
+# high-level database functions
+
+# get items from the database
+
+def get_plant(latin):
+    """
+    Returns the plant from the database matching the Latin name
+    """
+    data = db_get("plants", "latin", latin)
+    try:
+        data = data[0]
+    except IndexError:
+        errorandquit("Plant does not exist. Exiting.")
+    plant = {"id": data[0], "latin": data[1], "common": data[2],
+             "spots": data[3], "id_notes": data[4], "use_notes": data[5]}
+    return plant
+
+
+def get_spot(location):
+    """
+    Returns the spot from the database matching the w3w location
+    """
+    data = db_get("spots", "w3w_name", location)
+    try:
+        data = data[0]
+    except IndexError:
+        errorandquit("Spot does not exist. Exiting.")
+    spot = {"id": data[0], "w3w_name": data[1], "lat": str(data[2]),
+            "lng": str(data[3]), "plants": data[4], "notes": data[5]}
+    return spot
+
+
+# check if an item exists within the database
+
+def plant_exists(plant):
+    """
+    Returns True if the plant is in the database
+    """
+    return db_exists("plants", "latin", plant["latin"])
+
+
+def spot_exists(spot):
+    """
+    Returns True if the spot is in the database
+    """
+    return db_exists("spots", "location", spot["location"])
+
+
+# add items to the database
+
+def add_plant(plant):
+    """
+    Add the plant as a new database entry
+    """
+    plant["id"] = "NULL"
+    db_insert("plants", plant.values())
+
+
+def add_spot(spot):
+    """
+    Add the spot as a new database entry
+    """
+    spot["id"] = "NULL"
+    db_insert("spots", spot.values())
+
+
+def edit_plant(plant):
+    """
+    Update the plant within the database that shares its Latin name.
+    Removes empty values, appends csv values to csv fields, and replaces
+    other fields.
+    """
+    db_plant = get_plant(plant["latin"])
+    csv_keys = ["common", "spots", "id_notes", "use_notes"]
+    plant = construct_update_dict(plant, db_plant, csv_keys)
+    db_update_multi("plants", plant, "latin")
+
+
+def edit_spot(spot):
+    """
+    Update the spot within the database that shares its w3w location.
+    Removes empty values, appends csv values to csv fields, and replaces other
+    fields.
+    """
+    db_spot = get_spot(spot["w3w_name"])
+    csv_keys = ["plants", "notes"]
+    spot = construct_update_dict(spot, db_spot, csv_keys)
+    db_update_multi("spots", spot, "w3w_name")
+
+
+# adding notes to the database
+
+def add_note(text):
+    """
+    Add a note to the database and return its id number
+    """
+    timestamp = datetime.now()
+    note = ['NULL', timestamp, text]
+    note_id = db_insert("notes", note)
+    return note_id
+
+
+def add_note_to(object, field, text):
+    """
+    Create the note in the database, append the note id to field in the object,
+    and return the updated object.
+    """
+    note_id = add_note(text)
+    object[field] = append_csv_list(note_id, object[field])
+    return object
+
+
+def add_id_note(text, plant):
+    """
+    Add a note to the database, add its id number to the id_notes field of the
+    plant and then update the plant with the new id_notes field
+    """
+    plant = add_note_to(plant, "id_notes", text)
+    edit_plant(plant)
+
+
+def add_use_note(text, plant):
+    """
+    Add a note to the database, add its id number to the use_notes field of the
+    plant and then update the plant with the new use_notes field
+    """
+    plant = add_note_to(plant, "use_notes", text)
+    edit_plant(plant)
+
+
+def add_spot_note(text, spot):
+    """
+    Add a note to the database, add its id number to the notes field of the
+    spot and then update the spot with the new notes field
+    """
+    spot = add_note_to(spot, "notes", text)
+    edit_spot(spot)
+
+
+def db_plant(plant):
+    if plant_exists(plant):
+        edit_plant(plant)
+    else:
+        add_plant(plant)
+
+
+def db_spot(spot):
+    if spot_exists(spot):
+        edit_spot(spot)
+    else:
+        add_spot(spot)
+
+
+def db_plant_spot(plant, spot):
+    pass
+
+
+# test to see if argument prerequisites are in place
+
+if (args.common or args.idnote or args.usenote) and not do_plant:
+    errorandquit("Latin name must be specified if specifying a plant argument")
+
+if (args.spotnote) and not do_spot:
+    errorandquit("Location must be specified if specifying a spot argument")
+
+if db_new:
+    create_db()
+
+if do_plant_spot:
+    # do plant and spot and assign plant to spot
+    pass
+
+# Just do a plant
+
+elif do_plant:
+    # format and validate Latin name
+    latin = make_latin_case(args.latin)
+    if not is_latin(latin):
+        errorandquit("Latin name is not valid")
+
+    # only doing a plant, so no spot
+    spot = ""
+
+    # construct plant
+    plant = {"id": "", "latin": latin, "common": args.common,
+             "spots": spot, "id_notes": args.idnote, "use_notes": args.usenote}
+
+    # apply plant to database
+    db_plant(plant)
+
+elif do_spot:
+    # just do spot
+    if not is_w3w(args.location):
+        errorandquit("Invalid what3words location")
+
+    lat, lng = w3w_coord(args.location)
+    spot = {"id": "", "w3w_name": args.location, "lat": lat, "lng": lng,
+            "notes": args.spotnote}
+    db_spot(spot)
+
+else:
+    print("No arguments provided. Exiting.")
